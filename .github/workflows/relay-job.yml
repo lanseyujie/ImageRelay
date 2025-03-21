@@ -1,0 +1,105 @@
+name: relay-job
+
+on:
+  issues:
+    types: [opened, edited]
+
+jobs:
+  relay:
+    runs-on: ubuntu-latest
+    if: contains(github.event.issue.labels.*.name, 'relay-job') && github.event.repository.owner.id == github.event.sender.id
+    steps:
+      - name: Install Skopeo
+        run: |
+          sudo apt update
+          sudo apt install -y skopeo
+
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Copy Images
+        run: |
+          echo -e "## Report\n\n" > report.md
+          declare -A duplicate_images
+          while IFS= read -r line || [ -n "$line" ]; do
+              [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+
+              repo=$(echo "$line" | awk -F'/' '{if (NF==3) print $1 "/" $2; else if (NF==2) print $1; else if (NF==1) print "docker.io/library"; else print ""}')
+              image=${line##*/}
+              source="$repo/$image"
+              destination="${{ secrets.REPOSITORY }}/$image"
+
+              if ((duplicate_images[$source]++)); then
+                echo "::warning title=Skipped::⚠️ $source"
+                continue
+              fi
+
+              if skopeo copy --all --src-username "${{ secrets.SRC_USERNAME }}" --src-password "${{ secrets.SRC_PASSWORD }}" \
+                  --dest-username "${{ secrets.DEST_USERNAME }}" --dest-password "${{ secrets.DEST_PASSWORD }}" \
+                  docker://$source docker://$destination
+              then
+                echo "::notice title=Succeed::✅ $source"
+                echo -e "- **✅ $source**\n\n" >> report.md
+                echo -e "\`\`\`shell\n# docker\ndocker pull $destination\ndocker tag $destination $source\n\`\`\`\n\n" >> report.md
+                echo -e "\`\`\`shell\n# containerd\nctr -n k8s.io image pull $destination\nctr -n k8s.io image tag $destination $source\n\`\`\`\n\n" >> report.md
+              else
+                echo "::error title=Failed::❌ $source"
+                echo -e "- **❌ $source**\n\n" >> report.md
+              fi
+          done <<< "${{ github.event.issue.body }}"
+
+      - name: Add Report
+        if: ${{ hashFiles('report.md') }}
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs')
+            const data = fs.readFileSync('report.md', 'utf8')
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: data
+            })
+
+      - name: Success Label
+        if: ${{ success() }}
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.removeLabel({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              name: 'failure'
+            }).catch(() => {});
+            await github.rest.issues.addLabels({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              labels: ['success']
+            })
+
+      - name: Failure Label
+        if: ${{ failure() }}
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.removeLabel({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              name: 'success'
+            }).catch(() => {});
+            await github.rest.issues.addLabels({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              labels: ['failure']
+            })
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: "[Detail](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})"
+            })
